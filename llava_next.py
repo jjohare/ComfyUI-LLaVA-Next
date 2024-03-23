@@ -55,11 +55,8 @@ def get_installed_models():
     ]
 
 
-async def get_llava_next(
-    model,
-):
+async def get_llava_next(model):
     assert isinstance(model, str), f"{model} {type(model)=}"
-
     model_path = folder_paths.get_full_path(model_type, model + model_fmt)
 
     if not os.path.exists(model_path):
@@ -67,9 +64,10 @@ async def get_llava_next(
 
     start = time.monotonic()
 
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     processor = LlavaNextProcessor.from_pretrained(model)
     model = LlavaNextForConditionalGeneration.from_pretrained(model, torch_dtype=torch.float16, low_cpu_mem_usage=True)
-    model.to("cuda")
+    model.to(device)
 
     print(f"LLaVA-NeXT loaded in {time.monotonic() - start:.1f}s")
     return processor, model
@@ -98,7 +96,7 @@ async def get_caption(
     assert isinstance(temp, float), f"{temp} {type(temp)=}"
     assert isinstance(max_tokens, int), f"{max_tokens} {type(max_tokens)=}"
 
-    inputs = processor(text=prompt, images=image, return_tensors="pt").to("cuda")
+    inputs = processor(text=prompt, images=image, return_tensors="pt").to("cuda:0")
 
     start = time.monotonic()
     output = model.generate(**inputs, max_new_tokens=max_tokens, temperature=temp)
@@ -128,6 +126,9 @@ def wait_for_async(async_fn, loop=None):
 
 
 class LlavaNextCaptioner:
+    _model = None
+    _processor = None
+
     @classmethod
     def INPUT_TYPES(s):
         all_models = get_installed_models()
@@ -178,10 +179,10 @@ class LlavaNextCaptioner:
         tensor = image * 255
         tensor = np.array(tensor, dtype=np.uint8)
 
-        pbar = comfy.utils.ProgressBar(tensor.shape[0] + 1)
+        if self._model is None or self._processor is None:
+            self._processor, self._model = wait_for_async(lambda: get_llava_next(model))
 
-        processor, model = wait_for_async(lambda: get_llava_next(model))
-        pbar.update(1)
+        pbar = comfy.utils.ProgressBar(tensor.shape[0])
 
         tags = []
         for i in range(tensor.shape[0]):
@@ -189,8 +190,8 @@ class LlavaNextCaptioner:
             tags.append(
                 wait_for_async(
                     lambda: get_caption(
-                        processor,
-                        model,
+                        self._processor,
+                        self._model,
                         image,
                         prompt,
                         temperature,
