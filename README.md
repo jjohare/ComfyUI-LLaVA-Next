@@ -1,4 +1,4 @@
-# ComfyUI LLaVA Captioner
+# ComfyUI LLaVA-NEXT Captioner (ClaudeAI hack forward from upstream)
 
 A [ComfyUI](https://github.com/comfyanonymous/ComfyUI) extension for chatting with your images. Runs on your own system, no external services used, no filter.
 
