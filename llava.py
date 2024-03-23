@@ -1,4 +1,3 @@
-# parts of this looted from https://github.com/pythongosssss/ComfyUI-WD14-Tagger
 import asyncio
 import base64
 import os
@@ -9,14 +8,13 @@ from io import BytesIO
 import numpy as np
 import torch
 from PIL import Image
-from llama_cpp import Llama
-from llama_cpp.llama_chat_format import Llava15ChatHandler
+from transformers import LlavaNextProcessor, LlavaNextForConditionalGeneration
 
 import comfy.utils
 import folder_paths
 
-model_fmt = ".gguf"
-model_type = "llama"
+model_fmt = ".safetensors"
+model_type = "llava-next"
 system_message = (
     "You are an assistant who describes the content and composition of images. "
     "Describe only what you see in the image, not what you think the image is about. "
@@ -25,12 +23,10 @@ system_message = (
 
 
 defaults = {
-    "model": "llava-v1.5-7b-Q4_K",
-    "mmproj": "llava-v1.5-7b-mmproj-Q4_0",
+    "model": "llava-v1.6-mistral-7b-hf",
     "temperature": 0.2,
     "max_tokens": 40,
-    "prompt": "Please describe this image in 10 to 20 words.",
-    "n_gpu_layers": -1,
+    "prompt": "[INST] <image>\nWhat is shown in this image?[/INST]",
 }
 
 
@@ -46,7 +42,7 @@ def get_ext_dir(subpath=None, mkdir=False):
     return dir
 
 
-def get_installed_models(mm_proj=False):
+def get_installed_models():
     if model_type not in folder_paths.folder_names_and_paths:
         models_dir = get_ext_dir("models", mkdir=True)
         folder_paths.add_model_folder_path(model_type, models_dir)
@@ -55,47 +51,28 @@ def get_installed_models(mm_proj=False):
     return [
         re.sub(rf"{model_fmt}$", "", m)
         for m in models
-        if m.endswith(model_fmt) and ("mmproj" in m) == mm_proj
+        if m.endswith(model_fmt)
     ]
 
 
-async def get_llava(
+async def get_llava_next(
     model,
-    mm_proj,
-    n_gpu_layers=0,
 ):
-    if n_gpu_layers is None:
-        n_gpu_layers = 0
-
     assert isinstance(model, str), f"{model} {type(model)=}"
-    assert isinstance(mm_proj, str), f"{mm_proj} {type(mm_proj)=}"
-    assert isinstance(n_gpu_layers, int), f"{n_gpu_layers} {type(n_gpu_layers)=}"
 
     model_path = folder_paths.get_full_path(model_type, model + model_fmt)
-    mmproj_path = folder_paths.get_full_path(model_type, mm_proj + model_fmt)
 
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model {model_path} does not exist")
 
-    if not os.path.exists(mmproj_path):
-        raise FileNotFoundError(f"Model {mmproj_path} does not exist")
-
-    chat_handler = Llava15ChatHandler(clip_model_path=mmproj_path)
-
     start = time.monotonic()
 
-    # noinspection PyTypeChecker
-    llm = Llama(
-        model_path=model_path,
-        n_gpu_layers=n_gpu_layers,
-        chat_format="llava-1-5",
-        chat_handler=chat_handler,
-        n_ctx=2048,  # n_ctx should be increased to accomodate the image embedding
-        logits_all=True,
-        verbose=False,
-    )
-    print(f"LLM loaded in {time.monotonic() - start:.1f}s")
-    return llm
+    processor = LlavaNextProcessor.from_pretrained(model)
+    model = LlavaNextForConditionalGeneration.from_pretrained(model, torch_dtype=torch.float16, low_cpu_mem_usage=True)
+    model.to("cuda")
+
+    print(f"LLaVA-NeXT loaded in {time.monotonic() - start:.1f}s")
+    return processor, model
 
 
 def encode(image: Image.Image):
@@ -109,46 +86,26 @@ def encode(image: Image.Image):
 
 
 async def get_caption(
-    llm: Llama,
+    processor,
+    model,
     image: Image.Image,
     prompt,
     temp,
     max_tokens=35,
 ):
     assert isinstance(image, Image.Image), f"{image} {type(image)=}"
-    assert isinstance(system_message, str), f"{system_message} {type(system_message)=}"
     assert isinstance(prompt, str), f"{prompt} {type(prompt)=}"
     assert isinstance(temp, float), f"{temp} {type(temp)=}"
     assert isinstance(max_tokens, int), f"{max_tokens} {type(max_tokens)=}"
 
-    file_url = encode(image)
-    messages = [
-        {"role": "system", "content": system_message},
-        {
-            "role": "user",
-            "content": [
-                {"type": "image_url", "image_url": {"url": file_url}},
-                {"type": "text", "text": prompt},
-            ],
-        },
-    ]
+    inputs = processor(text=prompt, images=image, return_tensors="pt").to("cuda")
 
     start = time.monotonic()
-    response = llm.create_chat_completion(
-        messages=messages,
-        temperature=temp,
-        max_tokens=max_tokens,
-    )
+    output = model.generate(**inputs, max_new_tokens=max_tokens, temperature=temp)
     print(f"Response in {time.monotonic() - start:.1f}s")
 
-    first_resp: dict = response["choices"][0]
-    content = first_resp["message"]["content"]  # oh leave me alone type inferencing
-
-    # print(json.dumps(messages, indent=2))
-    # print(json.dumps(response, indent=2))
-    # print(content)
-
-    return content.strip()
+    caption = processor.decode(output[0], skip_special_tokens=True)
+    return caption.strip()
 
 
 def wait_for_async(async_fn, loop=None):
@@ -170,17 +127,15 @@ def wait_for_async(async_fn, loop=None):
     return res[0]
 
 
-class LlavaCaptioner:
+class LlavaNextCaptioner:
     @classmethod
     def INPUT_TYPES(s):
         all_models = get_installed_models()
-        all_mmproj = get_installed_models(mm_proj=True)
 
         return {
             "required": {
                 "image": ("IMAGE",),
                 "model": (all_models,),
-                "mm_proj": (all_mmproj,),
                 "prompt": (
                     "STRING",
                     {"default": defaults["prompt"], "multiline": True},
@@ -213,10 +168,9 @@ class LlavaCaptioner:
 
     CATEGORY = "image"
 
-    def caption(self, image, model, mm_proj, prompt, max_tokens, temperature):
+    def caption(self, image, model, prompt, max_tokens, temperature):
         assert isinstance(image, torch.Tensor), f"{image} {type(image)=}"
         assert isinstance(model, str), f"{model} {type(model)=}"
-        assert isinstance(mm_proj, str), f"{mm_proj} {type(mm_proj)=}"
         assert isinstance(prompt, str), f"{prompt} {type(prompt)=}"
         assert isinstance(max_tokens, int), f"{max_tokens} {type(max_tokens)=}"
         assert isinstance(temperature, float), f"{temperature} {type(temperature)=}"
@@ -226,7 +180,7 @@ class LlavaCaptioner:
 
         pbar = comfy.utils.ProgressBar(tensor.shape[0] + 1)
 
-        llava = wait_for_async(lambda: get_llava(model, mm_proj, -1))
+        processor, model = wait_for_async(lambda: get_llava_next(model))
         pbar.update(1)
 
         tags = []
@@ -235,7 +189,8 @@ class LlavaCaptioner:
             tags.append(
                 wait_for_async(
                     lambda: get_caption(
-                        llava,
+                        processor,
+                        model,
                         image,
                         prompt,
                         temperature,
@@ -249,8 +204,8 @@ class LlavaCaptioner:
 
 
 NODE_CLASS_MAPPINGS = {
-    "LlavaCaptioner": LlavaCaptioner,
+    "LlavaNextCaptioner": LlavaNextCaptioner,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "LlavaCaptioner": "LLaVA Captioner 🌊",
+    "LlavaNextCaptioner": "LLaVA-NeXT Captioner 🌊",
 }
